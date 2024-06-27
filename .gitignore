@@ -1,7 +1,10 @@
-gbadisasm
+ndsdisasm
 hashtable.c
 hashtable.h
 *.exe
-capstone-3.0.5-rc2
+capstone-*
 *.gba
 .fuse_hidden*
+*.nds
+.idea/
+cmake-build-*

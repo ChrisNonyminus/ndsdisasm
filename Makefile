@@ -1,35 +1,40 @@
-CAPSTONE_ARCHIVE := capstone-3.0.5-rc2.tar.gz
-CAPSTONE_DIR := capstone-3.0.5-rc2
-CAPSTONE_LIB := $(CAPSTONE_DIR)/libcapstone.a
+CAPSTONE_DIR := capstone
 
-DEBUG ?= 0
+DEBUG               ?= 0
+USE_SYSTEM_CAPSTONE ?= 1
 
-CC := gcc
-CFLAGS := -isystem $(CAPSTONE_DIR)/include -Wall -Wextra -Wpedantic
+CFLAGS := -Wall -Wextra -Wpedantic
 ifeq ($(DEBUG),1)
 CFLAGS += -O0 -g
 else
-CFLAGS += -O3
+CFLAGS += -O2 -g
 endif
-#CFLAGS += -fsanitize=address
-PROGRAM := gbadisasm
+CFLAGS += -fsanitize=address
+
+PROGRAM := ndsdisasm
 SOURCES := main.c disasm.c
-LIBS := $(CAPSTONE_LIB)
+HEADERS := ndsdisasm.h
+
+.PHONY: all capstone
+
+all: $(PROGRAM)
 
 # Compile the program
-$(PROGRAM): $(SOURCES) $(CAPSTONE_LIB)
-	$(CC) $(CFLAGS) $^ -o $@
+ifneq ($(USE_SYSTEM_CAPSTONE),1)
+$(PROGRAM): $(CAPSTONE_DIR)/libcapstone.a
+$(CAPSTONE_DIR)/libcapstone.a: capstone
+export PKG_CONFIG_PATH := $(CAPSTONE_DIR)
+endif
+
+$(PROGRAM): CFLAGS += $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --cflags capstone)
+$(PROGRAM): LDFLAGS += $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs capstone)
+$(PROGRAM): $(SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ $(SOURCES) $(LDFLAGS)
 
 # Build libcapstone
-$(CAPSTONE_LIB): $(CAPSTONE_DIR)
-	make -C $(CAPSTONE_DIR) CAPSTONE_STATIC=yes CAPSTONE_SHARED=no CAPSTONE_ARCHS="arm"
-
-# Extract the archive
-$(CAPSTONE_DIR): $(CAPSTONE_ARCHIVE)
-	tar -xvf $(CAPSTONE_ARCHIVE)
+capstone:
+	@$(MAKE) -C $(CAPSTONE_DIR) CAPSTONE_STATIC=yes CAPSTONE_SHARED=no CAPSTONE_ARCHS="arm" CAPSTONE_BUILD_CORE_ONLY=yes PREFIX=$(CAPSTONE_DIR)
 
 clean:
 	$(RM) $(PROGRAM) $(PROGRAM).exe
-
-distclean: clean
-	rm -rf $(CAPSTONE_DIR)
+	@$(MAKE) -C $(CAPSTONE_DIR) clean

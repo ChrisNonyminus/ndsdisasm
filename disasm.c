@@ -6,9 +6,9 @@
 
 #include <capstone.h>
 
-#include "gbadisasm.h"
+#include "ndsdisasm.h"
 
-extern void fatal_error(const char *fmt, ...);
+#define min(x, y) ((x) < (y) ? (x) : (y))
 
 uint32_t ROM_LOAD_ADDR;
 #define UNKNOWN_SIZE (uint32_t)-1
@@ -20,14 +20,32 @@ enum BranchType
     BRANCH_TYPE_BL,
 };
 
+const char * gBranchTypeNames[] = {
+    [BRANCH_TYPE_UNKNOWN] = "BRANCH_TYPE_UNKNOWN",
+    [BRANCH_TYPE_B]       = "BRANCH_TYPE_B",
+    [BRANCH_TYPE_BL]      = "BRANCH_TYPE_BL",
+};
+
+const char * gLabelTypeNames[] = {
+    [LABEL_ARM_CODE]            = "LABEL_ARM_CODE",
+    [LABEL_THUMB_CODE]          = "LABEL_THUMB_CODE",
+    [LABEL_DATA]                = "LABEL_DATA",
+    [LABEL_POOL]                = "LABEL_POOL",
+    [LABEL_JUMP_TABLE]          = "LABEL_JUMP_TABLE",
+    [LABEL_JUMP_TABLE_THUMB]    = "LABEL_JUMP_TABLE_THUMB",
+    [LABEL_JUMP_TABLE_THUMB_BX] = "LABEL_JUMP_TABLE_THUMB_BX",
+    [LABEL_ASCII]               = "LABEL_ASCII",
+};
+
 struct Label
 {
     uint32_t addr;
-    uint8_t type;
-    uint8_t branchType;
+    enum LabelType type;
+    enum BranchType branchType;
     uint32_t size;
     bool processed;
-    bool isFunc; // 100% sure it's a function, which cannot be changed to BRANCH_TYPE_B. 
+    bool isFunc; // 100% sure it's a function, which cannot be changed to BRANCH_TYPE_B.
+    bool isFromConfig;
     char *name;
 };
 
@@ -35,17 +53,22 @@ struct Label *gLabels = NULL;
 int gLabelsCount = 0;
 static int sLabelBufferCount = 0;
 static csh sCapstone;
+static int sJumpTableInsnIdx = 0;
 
 const bool gOptionShowAddrComments = false;
 const int gOptionDataColumnWidth = 16;
 
-int disasm_add_label(uint32_t addr, uint8_t type, char *name)
+int disasm_add_label(uint32_t addr, enum LabelType type, char *name, bool is_config)
 {
     int i;
-
+    // if(addr < gRamStart) return 0;
     //printf("adding label 0x%08X\n", addr);
     // Search for label
     //assert(addr >= ROM_LOAD_ADDR && addr < ROM_LOAD_ADDR + gInputFileBufferSize);
+    if ((type == LABEL_ARM_CODE && (addr & 3)) || (type == LABEL_THUMB_CODE && (addr & 1)))
+        fatal_error("Label at 0x%08x is misaligned.\n", addr);
+    if (ROM_LOAD_ADDR == 0 && addr == 0)
+        return -1;
     for (i = 0; i < gLabelsCount; i++)
     {
         if (gLabels[i].addr == addr)
@@ -75,7 +98,23 @@ int disasm_add_label(uint32_t addr, uint8_t type, char *name)
     gLabels[i].processed = false;
     gLabels[i].name = name;
     gLabels[i].isFunc = false;
+    gLabels[i].isFromConfig = is_config;
+
+    if((unsigned)(addr - ROM_LOAD_ADDR) > gInputFileBufferSize)
+    {
+        gLabels[i].processed = true;
+    }
+
     return i;
+}
+
+void FreeLabels(void)
+{
+    for (int i = 0; i < gLabelsCount; i++) {
+        if (gLabels[i].name != NULL)
+            free(gLabels[i].name);
+    }
+    free(gLabels);
 }
 
 // Utility Functions
@@ -94,6 +133,7 @@ static struct Label *lookup_label(uint32_t addr)
 
 static uint8_t byte_at(uint32_t addr)
 {
+    assert(addr < ROM_LOAD_ADDR + gInputFileBufferSize);
     return gInputFileBuffer[addr - ROM_LOAD_ADDR];
 }
 
@@ -130,6 +170,7 @@ static bool is_branch(const struct cs_insn *insn)
     case ARM_INS_B:
     case ARM_INS_BX:
     case ARM_INS_BL:
+    case ARM_INS_BLX:
         return true;
     }
     return false;
@@ -146,7 +187,7 @@ static bool is_func_return(const struct cs_insn *insn)
     if (insn->id == ARM_INS_MOV
      && arminsn->operands[0].type == ARM_OP_REG
      && arminsn->operands[0].reg == ARM_REG_PC)
-        return true;
+        return arminsn->cc == ARM_CC_AL;
     // 'pop' with pc in the register list
     if (insn->id == ARM_INS_POP)
     {
@@ -157,7 +198,7 @@ static bool is_func_return(const struct cs_insn *insn)
         {
             if (arminsn->operands[i].type == ARM_OP_REG
              && arminsn->operands[i].reg == ARM_REG_PC)
-                return true;
+                return arminsn->cc == ARM_CC_AL;
         }
     }
     return false;
@@ -189,6 +230,7 @@ static uint32_t get_branch_target(const struct cs_insn *insn)
 {
     assert(is_branch(insn));
     assert(insn->detail != NULL);
+    assert(insn->detail->arm.op_count > 0);
 
     return insn->detail->arm.operands[0].imm;
 }
@@ -197,49 +239,68 @@ static uint32_t get_branch_target(const struct cs_insn *insn)
 
 static int sJumpTableState = 0;
 
-static void jump_table_state_machine(const struct cs_insn *insn, uint32_t addr)
+static void jump_table_state_machine_thumb(const struct cs_insn *insn, uint32_t addr)
 {
     static uint32_t jumpTableBegin;
     // sometimes another instruction (like a mov) can interrupt
     static bool gracePeriod;
-    static uint32_t poolAddr;
+    static bool isBx;
 
     switch (sJumpTableState)
     {
-      case 0:
-        // "lsl rX, rX, 2"
+    case 0:
+        // add rX, rX, rX
         gracePeriod = false;
-        if (insn->id == ARM_INS_LSL)
+        if (insn->id == ARM_INS_ADD && insn->detail->arm.operands[2].type == ARM_OP_REG && insn->detail->arm.operands[1].reg == insn->detail->arm.operands[2].reg)
             goto match;
         break;
-      case 1:
-        // "ldr rX, [pc, ?]"
-        if (is_pool_load(insn))
-        {
-            poolAddr = get_pool_load(insn, addr, LABEL_THUMB_CODE);
-            jumpTableBegin = word_at(poolAddr);
+    case 1:
+        // add rX, pc
+        if (insn->id == ARM_INS_ADD && insn->detail->arm.operands[1].type == ARM_OP_REG && insn->detail->arm.operands[1].reg == ARM_REG_PC)
+            goto match;
+        break;
+    case 2:
+        // ldrh rX, [rX, #imm]
+        if (insn->id == ARM_INS_LDRH) {
+            jumpTableBegin = insn->detail->arm.operands[1].mem.disp + addr + 2;
             goto match;
         }
         break;
-      case 2:
-        // "add rX, rX, rX"
+    case 3:
+        // lsls rX, 16
+        if (insn->id == ARM_INS_LSL)
+            goto match;
+        break;
+    case 4:
+        // asrs rX, 16
+        if (insn->id == ARM_INS_ASR)
+            goto match;
+        break;
+    case 5:
+        // add pc, rX
         if (insn->id == ARM_INS_ADD)
-            goto match;
+        {
+            if (insn->detail->arm.operands[0].reg == ARM_REG_PC)
+            {
+                isBx = false;
+                goto match;
+            }
+            if (insn->detail->arm.operands[1].type == ARM_OP_REG
+             && insn->detail->arm.operands[1].reg == ARM_REG_PC)
+            {
+                sJumpTableState++;
+                return;
+            }
+        }
         break;
-      case 3:
-        // "ldr rX, [rX]"
-        if (insn->id == ARM_INS_LDR)
+    case 6:
+        if (is_func_return(insn))
+        {
+            isBx = true;
             goto match;
-        break;
-      case 4:
-        // "mov pc, rX"
-        if (insn->id == ARM_INS_MOV
-         && insn->detail->arm.operands[0].type == ARM_OP_REG
-         && insn->detail->arm.operands[0].reg == ARM_REG_PC)
-            goto match;
+        }
         break;
     }
-
     // didn't match
     if (gracePeriod)
         sJumpTableState = 0;
@@ -247,46 +308,47 @@ static void jump_table_state_machine(const struct cs_insn *insn, uint32_t addr)
         gracePeriod = true;
     return;
 
-  match:
-    if (sJumpTableState == 4)  // all checks passed
+    match:
+    if (sJumpTableState >= 5)  // all checks passed
     {
         uint32_t target;
         uint32_t firstTarget = -1u;
+        int i;
 
-        // jump table is not in ROM, indicating it's from a library loaded into RAM
-        if (!(jumpTableBegin & ROM_LOAD_ADDR))
+        for (i = 0; i < gLabelsCount; i++)
         {
-            uint32_t offset = poolAddr + 4 - jumpTableBegin;
-
-            disasm_add_label(poolAddr + 4, LABEL_JUMP_TABLE, NULL);
-            addr = poolAddr + 4; // start of jump table
-            while (addr < word_at(poolAddr + 4) + offset)
-            {
-                int label;
-
-                label = disasm_add_label(word_at(addr) + offset, LABEL_THUMB_CODE, NULL);
-                gLabels[label].branchType = BRANCH_TYPE_B;
-                addr += 4;
-            }
-            return;
+            if (gLabels[i].addr > jumpTableBegin && gLabels[i].addr < firstTarget)
+                firstTarget = gLabels[i].addr;
         }
 
-        disasm_add_label(jumpTableBegin, LABEL_JUMP_TABLE, NULL);
+        int numCases = -1;
+        for (i = 1; i < sJumpTableInsnIdx; i++) {
+            if (insn[-i].id == ARM_INS_CMP && insn[-i].detail->arm.operands[1].type == ARM_OP_IMM && insn[-i].detail->arm.operands[1].imm > 0) {
+                numCases = insn[-i].detail->arm.operands[1].imm + 1;
+                break;
+            }
+        }
+        i = 0;
+        assert(ROM_LOAD_ADDR == 0 || jumpTableBegin & ROM_LOAD_ADDR);
+        disasm_add_label(jumpTableBegin, isBx ? LABEL_JUMP_TABLE_THUMB_BX : LABEL_JUMP_TABLE_THUMB, NULL, false);
         sJumpTableState = 0;
         // add code labels from jump table
         addr = jumpTableBegin;
-        while (addr < firstTarget)
+        while (addr < firstTarget && (numCases < 0 || i < numCases))
         {
             int label;
 
-            target = word_at(addr);
+            target = hword_at(addr) + jumpTableBegin + (isBx ? 0 : 2);
             if (target - ROM_LOAD_ADDR >= 0x02000000)
                 break;
+            if (!isBx && (target & 1))
+                break;
             if (target < firstTarget && target > jumpTableBegin)
-                firstTarget = target;
-            label = disasm_add_label(target, LABEL_THUMB_CODE, NULL);
+                firstTarget = target & ~1;
+            label = disasm_add_label(target & ~1, (!isBx || (target & 3)) ? LABEL_THUMB_CODE : LABEL_ARM_CODE, NULL, false);
             gLabels[label].branchType = BRANCH_TYPE_B;
-            addr += 4;
+            addr += 2;
+            i++;
         }
 
         return;
@@ -294,7 +356,81 @@ static void jump_table_state_machine(const struct cs_insn *insn, uint32_t addr)
     sJumpTableState++;
 }
 
-static void renew_or_add_new_func_label(int type, uint32_t word)
+static void jump_table_state_machine(const struct cs_insn *insn, uint32_t addr, enum LabelType type)
+{
+    static uint32_t jumpTableBegin;
+
+    if (type == LABEL_THUMB_CODE) {
+        jump_table_state_machine_thumb(insn, addr);
+        return;
+    }
+    switch (sJumpTableState)
+    {
+    case 0:
+        if (insn->id == ARM_INS_ADD
+            && insn->detail->arm.operands[0].reg == ARM_REG_PC
+            && insn->detail->arm.operands[2].type == ARM_OP_REG
+            && insn->detail->arm.operands[2].shift.type == ARM_SFT_LSL
+            && insn->detail->arm.operands[2].shift.value == 2)
+            goto match;
+        break;
+    case 1:
+        if ((insn->id == ARM_INS_B && insn->detail->arm.cc == ARM_CC_AL) || is_func_return(insn))
+            goto match;
+        break;
+    }
+    sJumpTableState = 0;
+    return;
+match:
+    if (sJumpTableState == 1)
+    {
+        uint32_t target;
+        uint32_t firstTarget = (is_branch(insn) && !is_func_return(insn)) ? get_branch_target(insn) : -1u;
+        if (firstTarget < addr) firstTarget = -1u;
+        int i;
+        jumpTableBegin = addr + 4;
+        sJumpTableState = 0;
+        // add code labels from jump table
+        addr = jumpTableBegin;
+        int numCases = -1;
+        for (i = 1; i < sJumpTableInsnIdx; i++) {
+            if (insn[-i].id == ARM_INS_CMP) {
+                numCases = insn[-i].detail->arm.operands[1].imm + 1;
+                if (numCases > 1)
+                    break;
+            }
+        }
+        i = 0;
+        disasm_add_label(addr, LABEL_JUMP_TABLE, NULL, false);
+        while (addr < firstTarget && (numCases < 0 || i < numCases))
+        {
+            int label;
+            if (insn[i + 1].id == ARM_INS_B)
+            {
+                target = get_branch_target(&insn[i + 1]);
+                if (target - ROM_LOAD_ADDR >= 0x02000000)
+                {
+                    break;
+                }
+                if (target < firstTarget && target > jumpTableBegin)
+                {
+                    firstTarget = target;
+                }
+                label = disasm_add_label(target, LABEL_ARM_CODE, NULL, false);
+                gLabels[label].branchType = BRANCH_TYPE_B;
+            }
+            else if (!is_func_return(&insn[i + 1]))
+                break;
+            addr += 4;
+            i++;
+        }
+
+        return;
+    }
+    sJumpTableState++;
+}
+
+static void renew_or_add_new_func_label(enum LabelType type, uint32_t word)
 {
     if (word & ROM_LOAD_ADDR)
     {
@@ -310,14 +446,16 @@ static void renew_or_add_new_func_label(int type, uint32_t word)
         else
         {
             // implicitly set to BRANCH_TYPE_BL
-            gLabels[disasm_add_label(word & ~1, type, NULL)].isFunc = true;
+            int lab = disasm_add_label(word & ~1, type, NULL, false);
+            assert(lab != -1);
+            gLabels[lab].isFunc = true;
         }
     }
 }
 
-static bool IsValidInstruction(cs_insn * insn, int type)
+static bool IsValidInstruction(cs_insn * insn, enum LabelType type)
 {
-    if (cs_insn_group(sCapstone, insn, ARM_GRP_V4T))
+    if (cs_insn_group(sCapstone, insn, isArm7 ? ARM_GRP_V4T : ARM_GRP_V5T))
         return true;
     if (type == LABEL_ARM_CODE) {
         return cs_insn_group(sCapstone, insn, ARM_GRP_ARM);
@@ -333,7 +471,7 @@ static void analyze(void)
         int li;
         int i;
         uint32_t addr;
-        int type;
+        enum LabelType type;
         struct cs_insn *insn;
         const int dismAllocSize = 0x1000;
         int count;
@@ -342,6 +480,11 @@ static void analyze(void)
             return;
         addr = gLabels[li].addr;
         type = gLabels[li].type;
+        if (addr < ROM_LOAD_ADDR || addr >= ROM_LOAD_ADDR + gInputFileBufferSize)
+        {
+            gLabels[li].processed = true;
+            continue;
+        }
 
         if (type == LABEL_ARM_CODE || type == LABEL_THUMB_CODE)
         {
@@ -350,9 +493,11 @@ static void analyze(void)
             //fprintf(stderr, "analyzing label at 0x%08X\n", addr);
             do
             {
-                count = cs_disasm(sCapstone, gInputFileBuffer + addr - ROM_LOAD_ADDR, 0x1000, addr, 0, &insn);
+                uint32_t offset = addr - ROM_LOAD_ADDR;
+                count = cs_disasm(sCapstone, gInputFileBuffer + offset, min(0x1000, gInputFileBufferSize - offset), addr, 0, &insn);
                 for (i = 0; i < count; i++)
                 {
+                    sJumpTableInsnIdx = i;
                   no_inc:
                     if (!IsValidInstruction(&insn[i], type)) {
                         if (type == LABEL_THUMB_CODE)
@@ -362,10 +507,12 @@ static void analyze(void)
                             addr += 2;
                             if (insn[i].size == 2) continue;
                             tmp_cnt = cs_disasm(sCapstone, gInputFileBuffer + addr - ROM_LOAD_ADDR, 2, addr, 0, &tmp);
-                            assert(tmp_cnt == 1);
-                            free(insn[i].detail);
-                            insn[i] = *tmp;
-                            free(tmp);
+                            if (tmp_cnt != 0)
+                            {
+                                free(insn[i].detail);
+                                insn[i] = *tmp;
+                                free(tmp);
+                            }
                             goto no_inc;
                         }
                         else
@@ -374,7 +521,7 @@ static void analyze(void)
                             continue;
                         }
                     };
-                    jump_table_state_machine(&insn[i], addr);
+                    jump_table_state_machine(&insn[i], addr, type);
 
                     // fprintf(stderr, "/*0x%08X*/ %s %s\n", addr, insn[i].mnemonic, insn[i].op_str);
                     if (is_branch(&insn[i]))
@@ -388,6 +535,33 @@ static void analyze(void)
                         if (is_func_return(&insn[i]))
                         {
                             struct Label *label_p;
+
+                            if (insn[i].id == ARM_INS_BX && insn[i].detail->arm.operands[0].type == ARM_OP_REG)
+                            {
+                                for (int j = i - 1; j >= 0; j--)
+                                {
+                                    if (insn[j].detail->arm.operands[0].reg == insn[i].detail->arm.operands[0].reg)
+                                    {
+                                        if (is_pool_load(&insn[j]))
+                                        {
+                                            // Tail call
+                                            uint32_t pool_target = word_at(
+                                                get_pool_load(&insn[j], insn[j].address, type));
+                                            int added = disasm_add_label(
+                                                pool_target & ~1,
+                                                pool_target & 3 ? LABEL_THUMB_CODE : LABEL_ARM_CODE,
+                                                NULL,
+                                                false
+                                            );
+                                            if (added >= 0 && added < gLabelsCount)
+                                            {
+                                                gLabels[added].isFunc = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
 
                             // It's possible that handwritten code with different mode follows. 
                             // However, this only causes problem when the address following is
@@ -407,32 +581,40 @@ static void analyze(void)
                         if (insn[i].id == ARM_INS_BX) // BX{COND} when COND != AL
                             continue;
 
+                        if (insn[i].id == ARM_INS_BLX && insn[i].detail->arm.operands[0].type == ARM_OP_REG)
+                            continue;
+
                         target = get_branch_target(&insn[i]);
                         assert(target != 0);
 
                         // I don't remember why I needed this condition
                         //if (!(target >= gLabels[li].addr && target <= currAddr))
-                        if (1)
+                        if (target != addr)
                         {
-                            int lbl = disasm_add_label(target, type, NULL);
+                            enum LabelType newtype = type;
+                            if (insn[i].id == ARM_INS_BLX)
+                                newtype = type == LABEL_THUMB_CODE ? LABEL_ARM_CODE : LABEL_THUMB_CODE;
+                            int lbl = disasm_add_label(target, newtype, NULL, false);
 
                             if (!gLabels[lbl].isFunc) // do nothing if it's 100% a func (from func ptr, or instant mode exchange)
                             {
-                                if (insn[i].id == ARM_INS_BL)
+                                if (insn[i].id == ARM_INS_BL || insn[i].id == ARM_INS_BLX)
                                 {
                                     const struct Label *next;
 
-                                    lbl = disasm_add_label(target, type, NULL);
                                     if (gLabels[lbl].branchType != BRANCH_TYPE_B)
                                         gLabels[lbl].branchType = BRANCH_TYPE_BL;
-                                    // if the address right after is a pool, then we know
-                                    // for sure that this is a far jump and not a function call
-                                    if (((next = lookup_label(addr)) != NULL && next->type == LABEL_POOL)
-                                    // if the 2 bytes following are zero, assume it's padding
-                                     || hword_at(addr) == 0)
+                                    if (insn[i].id != ARM_INS_BLX)
                                     {
-                                        gLabels[lbl].branchType = BRANCH_TYPE_B;
-                                        break;
+                                        // if the address right after is a pool, then we know
+                                        // for sure that this is a far jump and not a function call
+                                        if (((next = lookup_label(addr)) != NULL && next->type == LABEL_POOL)
+                                            // if the 2 bytes following are zero, assume it's padding
+                                            || (type == LABEL_THUMB_CODE && ((addr & 3) != 0) && hword_at(addr) == 0))
+                                        {
+                                            gLabels[lbl].branchType = BRANCH_TYPE_B;
+                                            break;
+                                        }
                                     }
                                 }
                                 else
@@ -445,9 +627,8 @@ static void analyze(void)
                                 }
                             }
                         }
-
                         // unconditional jump and not a function call
-                        if (insn[i].detail->arm.cc == ARM_CC_AL && insn[i].id != ARM_INS_BL)
+                        if (insn[i].detail->arm.cc == ARM_CC_AL && insn[i].id != ARM_INS_BL && insn[i].id != ARM_INS_BLX)
                             break;
                     }
                     else
@@ -506,8 +687,14 @@ static void analyze(void)
                             poolAddr = get_pool_load(&insn[i], addr - insn[i].size, type);
                             assert(poolAddr != 0);
                             assert((poolAddr & 3) == 0);
-                            disasm_add_label(poolAddr, LABEL_POOL, NULL);
+                            disasm_add_label(poolAddr, LABEL_POOL, NULL, false);
                             word = word_at(poolAddr);
+                            if (insn[i].detail->arm.operands[0].reg == ARM_REG_PC)
+                            {
+                                renew_or_add_new_func_label(word & 1 ? LABEL_THUMB_CODE : LABEL_ARM_CODE, word);
+                                if (insn[i].detail->arm.cc == ARM_CC_AL)
+                                    break;
+                            }
 
                         check_handwritten_indirect_jump:
                             if (i < count - 1) // is not last insn in the chunk
@@ -542,6 +729,28 @@ static void analyze(void)
 
 // Disassembly Output
 
+static uint32_t print_align(uint32_t addr, enum LabelType labelType)
+{
+    if (labelType == LABEL_THUMB_CODE)
+    {
+        if ((addr & 3) == 2)
+        {
+            uint16_t next_short = hword_at(addr);
+            if (next_short == 0)
+            {
+                fputs("\t.align 2, 0\n", stdout);
+                addr += 2;
+            }
+            else if (next_short == 0x46C0)
+            {
+                fputs("\tnop\n", stdout);
+                addr += 2;
+            }
+        }
+    }
+    return addr;
+}
+
 static void print_gap(uint32_t addr, uint32_t nextaddr)
 {
     if (addr == nextaddr)
@@ -549,21 +758,6 @@ static void print_gap(uint32_t addr, uint32_t nextaddr)
 
     assert(addr < nextaddr);
 
-    if ((addr & 3) == 2) {
-        uint16_t next_short = hword_at(addr);
-        if (next_short == 0) {
-            fputs("\t.align 2, 0\n", stdout);
-            addr += 2;
-        } else if (next_short == 0x46C0) {
-            fputs("\tnop\n", stdout);
-            addr += 2;
-        }
-        if (addr == nextaddr) {
-            return;
-        }
-    }
-
-    printf("_%08X:\n", addr);
     if (addr % gOptionDataColumnWidth != 0)
         fputs("\t.byte", stdout);
     while (addr < nextaddr)
@@ -579,24 +773,42 @@ static void print_gap(uint32_t addr, uint32_t nextaddr)
     }
 }
 
-static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
+static void __attribute__((format(printf, 1, 3))) do_print_insn(const char * fmt, int caseNum, ...)
 {
+    va_list va_args;
+    va_start(va_args, caseNum);
+    vprintf(fmt, va_args);
+    if (caseNum >= 0)
+        printf(" @ case %d\n", caseNum);
+    else
+        putchar('\n');
+    va_end(va_args);
+}
+
+static void print_insn(const cs_insn *insn, uint32_t addr, int mode, int caseNum)
+{
+    struct Label DummyLabel;
     if (gOptionShowAddrComments)
     {
-        printf("\t/*0x%08X*/ %s %s\n", addr, insn->mnemonic, insn->op_str);
+        do_print_insn("\t/*0x%08X*/ %s %s", caseNum, addr, insn->mnemonic, insn->op_str);
     }
     else
     {
-        if (is_branch(insn) && insn->id != ARM_INS_BX)
+        if (is_branch(insn) && insn->detail->arm.operands[0].type != ARM_OP_REG)
         {
             uint32_t target = get_branch_target(insn);
             struct Label *label = lookup_label(target);
 
-            assert(label != NULL);  // We should have found this label in the analysis phase
+            if (label == NULL) {
+                DummyLabel.addr = target;
+                DummyLabel.name = NULL;
+                DummyLabel.branchType = BRANCH_TYPE_BL;
+                label = &DummyLabel;
+            }
             if (label->name != NULL)
-                printf("\t%s %s\n", insn->mnemonic, label-> name);
+                do_print_insn("\t%s %s", caseNum, insn->mnemonic, label->name);
             else
-                printf("\t%s %s_%08X\n", insn->mnemonic, label->branchType == BRANCH_TYPE_BL ? "sub" : "", target);
+                do_print_insn("\t%s %s%08X", caseNum, insn->mnemonic, (label->branchType == BRANCH_TYPE_BL ? functionPrefix : "_"), target);
         }
         else if (is_pool_load(insn))
         {
@@ -604,16 +816,16 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
             uint32_t value = word_at(word);
             const struct Label *label_p;
 
-            if (value & 3 && value & ROM_LOAD_ADDR) // possibly thumb function
+            if (value & 3 && (value & ROM_LOAD_ADDR & 0x0F000000) == (ROM_LOAD_ADDR & 0x0F000000)) // possibly thumb function
             {
                 if (label_p = lookup_label(value & ~1), label_p != NULL)
                 {
                     if (label_p->branchType == BRANCH_TYPE_BL && label_p->type == LABEL_THUMB_CODE)
                     {
                         if (label_p->name != NULL)
-                            printf("\t%s %s, _%08X @ =%s\n", insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, label_p->name);
+                            do_print_insn("\t%s %s, _%08X @ =%s", caseNum, insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, label_p->name);
                         else
-                            printf("\t%s %s, _%08X @ =sub_%08X\n", insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, value & ~1);
+                            do_print_insn("\t%s %s, _%08X @ =%s%08X", caseNum, insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, functionPrefix, value & ~1);
                         return;
                     }
                 }
@@ -624,16 +836,16 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
                 if (label_p->type != LABEL_THUMB_CODE)
                 {
                     if (label_p->name != NULL)
-                        printf("\t%s %s, _%08X @ =%s\n", insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, label_p->name);
+                        do_print_insn("\t%s %s, _%08X @ =%s", caseNum, insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, label_p->name);
                     else if (label_p->branchType == BRANCH_TYPE_BL)
-                        printf("\t%s %s, _%08X @ =sub_%08X\n", insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, value);
+                        do_print_insn("\t%s %s, _%08X @ =%s%08X", caseNum, insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, functionPrefix, value);
                     else // normal label
-                        printf("\t%s %s, _%08X @ =_%08X\n",
+                        do_print_insn("\t%s %s, _%08X @ =_%08X", caseNum,
                           insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, value);
                     return;
                 }
             }
-            printf("\t%s %s, _%08X @ =0x%08X\n", insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, value);
+            do_print_insn("\t%s %s, _%08X @ =0x%08X", caseNum, insn->mnemonic, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), word, value);
         }
         else
         {
@@ -644,7 +856,7 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
              && insn->detail->arm.operands[1].reg == ARM_REG_SP
              && insn->detail->arm.operands[2].type == ARM_OP_REG)
             {
-                printf("\t%s %s, %s\n",
+                do_print_insn("\t%s %s, %s", caseNum,
                   insn->mnemonic,
                   cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg),
                   cs_reg_name(sCapstone, insn->detail->arm.operands[1].reg));
@@ -660,15 +872,15 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
                     if (label_p->type != LABEL_THUMB_CODE)
                     {
                         if (label_p->name != NULL)
-                            printf("\tadd %s, pc, #0x%X @ =%s\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, label_p->name);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =%s", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, label_p->name);
                         else if (label_p->branchType == BRANCH_TYPE_BL)
-                            printf("\tadd %s, pc, #0x%X @ =sub_%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, word);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =%s%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, functionPrefix, word);
                         else
-                            printf("\tadd %s, pc, #0x%X @ =_%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, word);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =_%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm, word);
                         return;
                     }
                 }
-                printf("\tadd %s, pc, #0x%X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm);
+                do_print_insn("\tadd %s, pc, #0x%X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[1].imm);
             }
             // arm adr
             else if (mode == LABEL_ARM_CODE
@@ -688,9 +900,9 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
                         if (label_p->branchType == BRANCH_TYPE_BL && label_p->type == LABEL_THUMB_CODE)
                         {
                             if (label_p->name != NULL)
-                                printf("\tadd %s, pc, #0x%X @ =%s\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, label_p->name);
+                                do_print_insn("\tadd %s, pc, #0x%X @ =%s", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, label_p->name);
                             else
-                                printf("\tadd %s, pc, #0x%X @ =sub_%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word & ~1);
+                                do_print_insn("\tadd %s, pc, #0x%X @ =%s%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, functionPrefix, word & ~1);
                             return;
                         }
                     }
@@ -701,18 +913,18 @@ static void print_insn(const cs_insn *insn, uint32_t addr, int mode)
                     if (label_p->type != LABEL_THUMB_CODE)
                     {
                         if (label_p->name != NULL)
-                            printf("\tadd %s, pc, #0x%X @ =%s\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, label_p->name);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =%s", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, label_p->name);
                         else if (label_p->branchType == BRANCH_TYPE_BL)
-                            printf("\tadd %s, pc, #0x%X @ =sub_%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =%s%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, functionPrefix, word);
                         else
-                            printf("\tadd %s, pc, #0x%X @ =_%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word);
+                            do_print_insn("\tadd %s, pc, #0x%X @ =_%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word);
                         return;
                     }
                 }
-                printf("\tadd %s, pc, #0x%X @ =0x%08X\n", cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word);
+                do_print_insn("\tadd %s, pc, #0x%X @ =0x%08X", caseNum, cs_reg_name(sCapstone, insn->detail->arm.operands[0].reg), insn->detail->arm.operands[2].imm, word);
             }
             else
-                printf("\t%s %s\n", insn->mnemonic, insn->op_str);
+                do_print_insn("\t%s %s", caseNum, insn->mnemonic, insn->op_str);
         }
     }
 }
@@ -724,10 +936,15 @@ static int qsort_label_compare(const void *a, const void *b)
 
 static void print_disassembly(void)
 {
-    uint32_t addr = ROM_LOAD_ADDR;
+    //uint32_t addr = ROM_LOAD_ADDR;
     int i = 0;
+    int li;
+    char last_name[256] = "";
+    enum LabelType last_label = LABEL_DATA;
+    uint32_t endaddr = -1u;
 
     qsort(gLabels, gLabelsCount, sizeof(*gLabels), qsort_label_compare);
+    uint32_t addr = gLabels[0].addr, lastAddr = addr;
 
     for (i = 0; i < gLabelsCount - 1; i++)
         assert(gLabels[i].addr < gLabels[i + 1].addr);
@@ -743,16 +960,37 @@ static void print_disassembly(void)
             gLabels[i].branchType = BRANCH_TYPE_BL;
 
     i = 0;
+    if (addr > ROM_LOAD_ADDR && dumpUnDisassembled)
+    {
+        printf("_%08X:\n", ROM_LOAD_ADDR);
+        print_gap(ROM_LOAD_ADDR, min(addr, ROM_LOAD_ADDR + gInputFileBufferSize));
+    }
+
     while (addr < ROM_LOAD_ADDR + gInputFileBufferSize)
     {
+        li = i;
         uint32_t nextAddr;
+        if (gLabels[i].addr < ROM_LOAD_ADDR)
+        {
+            goto next;
+        }
+        if (gLabels[i].addr >= ROM_LOAD_ADDR + gInputFileBufferSize)
+            break;
 
         // TODO: compute actual size during analysis phase
+        if (gLabels[i].type == LABEL_POOL)
+            gLabels[i].size = 4;
         if (i + 1 < gLabelsCount)
         {
             if (gLabels[i].size == UNKNOWN_SIZE
              || gLabels[i].addr + gLabels[i].size > gLabels[i + 1].addr)
                 gLabels[i].size = gLabels[i + 1].addr - gLabels[i].addr;
+            if (gLabels[i].addr + gLabels[i].size >= ROM_LOAD_ADDR + gInputFileBufferSize)
+            {
+                if (gLabels[i].type != LABEL_DATA)
+                    break;
+                gLabels[i].size = ROM_LOAD_ADDR + gInputFileBufferSize - gLabels[i].addr;
+            }
         }
 
         switch (gLabels[i].type)
@@ -775,20 +1013,15 @@ static void print_disassembly(void)
                         fprintf(stderr, "error: function at 0x%08X is not aligned\n", addr);
                         return;
                     }
+                    last_label = gLabels[i].type;
                     if (gLabels[i].name != NULL)
-                    {
-                        printf("\n\t%s %s\n",
-                          (gLabels[i].type == LABEL_ARM_CODE) ? "arm_func_start" : (addr & 2 ? "non_word_aligned_thumb_func_start" : "thumb_func_start"),
-                          gLabels[i].name);
-                        printf("%s: @ 0x%08X\n", gLabels[i].name, addr);
-                    }
+                        strcpy(last_name, gLabels[i].name);
                     else
-                    {
-                        printf("\n\t%s sub_%08X\n",
-                          (gLabels[i].type == LABEL_ARM_CODE) ? "arm_func_start" : (addr & 2 ? "non_word_aligned_thumb_func_start" : "thumb_func_start"),
-                          addr);
-                        printf("sub_%08X: @ 0x%08X\n", addr, addr);
-                    }
+                        sprintf(last_name, "%s%08X", functionPrefix, addr);
+                    printf("\n\t%s %s\n",
+                           (last_label == LABEL_ARM_CODE) ? "arm_func_start" : (addr & 2 ? "non_word_aligned_thumb_func_start" : "thumb_func_start"),
+                           last_name);
+                    printf("%s: @ 0x%08X\n", last_name, addr);
                 }
                 // Just a normal code label. Use the '_XXXXXXXX' label
                 else
@@ -814,10 +1047,12 @@ static void print_disassembly(void)
                             addr += 2;
                             if (insn[j].size == 2) continue;
                             tmp_cnt = cs_disasm(sCapstone, gInputFileBuffer + addr - ROM_LOAD_ADDR, 2, addr, 0, &tmp);
-                            assert(tmp_cnt == 1);
-                            free(insn[j].detail);
-                            insn[j] = *tmp;
-                            free(tmp);
+                            if (tmp_cnt != 0)
+                            {
+                                free(insn[j].detail);
+                                insn[j] = *tmp;
+                                free(tmp);
+                            }
                             goto no_inc;
                         }
                         else
@@ -827,7 +1062,7 @@ static void print_disassembly(void)
                             continue;
                         }
                     }
-                    print_insn(&insn[j], addr, gLabels[i].type);
+                    print_insn(&insn[j], addr, gLabels[i].type, -1);
                     addr += insn[j].size;
                 }
                 cs_free(insn, count);
@@ -851,7 +1086,7 @@ static void print_disassembly(void)
                 uint32_t value = word_at(addr);
                 const struct Label *label_p;
 
-                if (value & 3 && value & ROM_LOAD_ADDR) // possibly thumb function
+                if (value & 3 && (value & ROM_LOAD_ADDR & 0x0F000000) == (ROM_LOAD_ADDR & 0x0F000000)) // possibly thumb function
                 {
                     if (label_p = lookup_label(value & ~1), label_p != NULL)
                     {
@@ -860,7 +1095,7 @@ static void print_disassembly(void)
                             if (label_p->name != NULL)
                                 printf("_%08X: .4byte %s\n", addr, label_p->name);
                             else
-                                printf("_%08X: .4byte sub_%08X\n", addr, value & ~1);
+                                printf("_%08X: .4byte %s%08X\n", addr, functionPrefix, value & ~1);
                             addr += 4;
                             break;
                         }
@@ -874,7 +1109,7 @@ static void print_disassembly(void)
                         if (label_p->name != NULL)
                             printf("_%08X: .4byte %s\n", addr, label_p->name);
                         else if (label_p->branchType == BRANCH_TYPE_BL)
-                            printf("_%08X: .4byte sub_%08X\n", addr, value);
+                            printf("_%08X: .4byte %s%08X\n", addr, functionPrefix, value);
                         else // normal label
                             printf("_%08X: .4byte _%08X\n", addr, value);
                         addr += 4;
@@ -885,37 +1120,122 @@ static void print_disassembly(void)
                 addr += 4;
             }
             break;
+        case LABEL_JUMP_TABLE_THUMB:
+        case LABEL_JUMP_TABLE_THUMB_BX:
+        {
+            uint32_t start = addr;
+            uint32_t end = addr + gLabels[i].size;
+            int caseNum = 0;
+
+            printf("_%08X: @ jump table\n", addr);
+            while (addr < end)
+            {
+                uint16_t offset = hword_at(addr);
+                uint32_t word = start + offset + (gLabels[i].type == LABEL_JUMP_TABLE_THUMB_BX ? 0 : 2);
+
+                if (gLabels[i].type == LABEL_JUMP_TABLE_THUMB_BX)
+                    printf("\t.2byte _%08X - _%08X + %d @ case %i\n", word & ~1, start, word & 1 ? 1 : 0, caseNum);
+                else
+                    printf("\t.2byte _%08X - _%08X - 2 @ case %i\n", word & ~1, start, caseNum);
+                caseNum++;
+                addr += 2;
+            }
+        }
+            break;
         case LABEL_JUMP_TABLE:
             {
-                uint32_t end = addr + gLabels[i].size;
+                struct cs_insn * insn;
+                cs_option(sCapstone, CS_OPT_MODE, CS_MODE_ARM);
+                int count = cs_disasm(sCapstone, gInputFileBuffer + addr - ROM_LOAD_ADDR, gLabels[i].size, addr, 0, &insn);
                 int caseNum = 0;
 
                 printf("_%08X: @ jump table\n", addr);
-                while (addr < end)
+                for (caseNum = 0; caseNum < count; caseNum++)
                 {
-                    uint32_t word = word_at(addr);
-                    
-                    if (word & ROM_LOAD_ADDR)
-                        printf("\t.4byte _%08X @ case %i\n", word, caseNum);
-                    else
-                        printf("\t.4byte 0x%08X @ case %i\n", word, caseNum);
-                    caseNum++;
+                    print_insn(&insn[caseNum], addr, LABEL_ARM_CODE, caseNum);
                     addr += 4;
                 }
+                cs_free(insn, count);
+            }
+            break;
+        case LABEL_DATA:
+            if (gLabels[i].size == UNKNOWN_SIZE || i + 1 >= gLabelsCount)
+                nextAddr = ROM_LOAD_ADDR + gInputFileBufferSize;
+            else
+                nextAddr = min(gLabels[i + 1].addr, ROM_LOAD_ADDR + gInputFileBufferSize);
+            if (gLabels[i].name)
+                printf("%s: @ 0x%08X\n", gLabels[i].name, addr);
+            else
+                printf("_%08X:\n", addr);
+            print_gap(addr, nextAddr);
+            addr = nextAddr;
+            break;
+        case LABEL_ASCII:
+            if (gLabels[i].name)
+                printf("%s: @ 0x%08X\n", gLabels[i].name, addr);
+            else
+                printf("_%08X:\n", addr);
+            const char * s = (const char *)&gInputFileBuffer[addr - ROM_LOAD_ADDR];
+            size_t slen = strlen(s);
+            if (addr + slen + 1 >= ROM_LOAD_ADDR + gInputFileBufferSize)
+                fatal_error("Improperly terminated string at 0x%08X\n", addr);
+            printf("\t.asciz \"%s\"\n", s);
+            addr += slen + 1;
+            break;
+        default:
+            fatal_error("unrecognized label type: %d\n", gLabels[i].type);
+        }
+        endaddr = addr = print_align(addr, gLabels[i].type);
+    next:
+        i++;
+        if (i >= gLabelsCount)
+        {
+            // This is a function end
+            if (last_name[0])
+            {
+                printf("\t%s %s\n", (last_label == LABEL_THUMB_CODE) ? "thumb_func_end" : "arm_func_end", last_name);
+                last_name[0] = 0;
             }
             break;
         }
 
-        i++;
-        if (i >= gLabelsCount)
-            break;
         nextAddr = gLabels[i].addr;
-        assert(addr <= nextAddr);
+        // assert(addr <= nextAddr);
+        while (addr > nextAddr) {
+            fprintf(stderr, "Warning: label at 0x%08X is inside function at 0x%08X\n"
+                            "(trying to insert %s into %s)\n", nextAddr, lastAddr, gLabelTypeNames[gLabels[i].type], gLabelTypeNames[gLabels[li].type]);
+            ++i;
+            if (i == gLabelsCount)
+                break;
+            nextAddr = gLabels[i].addr;
+        }
+        assert(i != gLabelsCount);
+        lastAddr = nextAddr;
 
-        if (nextAddr <= ROM_LOAD_ADDR + gInputFileBufferSize) // prevent out-of-bound read
-            print_gap(addr, nextAddr);
+        if (((last_label != LABEL_DATA
+         && (gLabels[i].type == LABEL_THUMB_CODE || gLabels[i].type == LABEL_ARM_CODE)
+         && gLabels[i].branchType == BRANCH_TYPE_BL) || (gLabels[i].isFromConfig))
+         && last_name[0])
+        {
+            // This is a function end
+            printf("\t%s %s\n", (last_label == LABEL_THUMB_CODE) ? "thumb_func_end" : "arm_func_end", last_name);
+            last_name[0] = 0;
+        }
+
+        if (addr >= ROM_LOAD_ADDR && (nextAddr <= ROM_LOAD_ADDR + gInputFileBufferSize || dumpUnDisassembled) && addr != nextAddr) // prevent out-of-bound read
+        {
+            printf("_%08X:\n", addr);
+            print_gap(addr, min(nextAddr, ROM_LOAD_ADDR + gInputFileBufferSize));
+        }
         addr = nextAddr;
     }
+    if (dumpUnDisassembled && addr >= ROM_LOAD_ADDR && addr < ROM_LOAD_ADDR + gInputFileBufferSize)
+    {
+        printf("_%08X:\n", addr);
+        print_gap(addr, ROM_LOAD_ADDR + gInputFileBufferSize);
+    }
+    else
+        printf("\t@ 0x%08X\n", endaddr);
 }
 
 void disasm_disassemble(void)
@@ -928,13 +1248,7 @@ void disasm_disassemble(void)
     }
     cs_option(sCapstone, CS_OPT_DETAIL, CS_OPT_ON);
 
-    // entry point
-    disasm_add_label(ROM_LOAD_ADDR, LABEL_ARM_CODE, NULL);
-
-    // rom header
-    disasm_add_label(ROM_LOAD_ADDR + 4, LABEL_DATA, NULL);
-
     analyze();
     print_disassembly();
-    free(gLabels);
+    FreeLabels();
 }

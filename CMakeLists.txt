@@ -1,0 +1,8 @@
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
+INCLUDE(FindPkgConfig)
+PROJECT(ndsdisasm)
+PKG_SEARCH_MODULE(capstone REQUIRED capstone)
+ADD_EXECUTABLE(ndsdisasm main.c disasm.c)
+TARGET_INCLUDE_DIRECTORIES(ndsdisasm PRIVATE ${capstone_INCLUDE_DIRS})
+TARGET_LINK_LIBRARIES(ndsdisasm PRIVATE ${capstone_LINK_LIBRARIES})
+SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
